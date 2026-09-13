@@ -2,17 +2,23 @@
 Routes for interacting with log objects.
 """
 
-from typing import Optional, Sequence
+from typing import TYPE_CHECKING, Optional, Sequence
 
-from fastapi import Body, Depends, WebSocket, status
+from fastapi import Body, Depends, HTTPException, WebSocket, status
 from pydantic import TypeAdapter
 from starlette.status import WS_1002_PROTOCOL_ERROR
 
 import prefect.server.api.dependencies as dependencies
-import prefect.server.models as models
-from prefect.server.database import PrefectDBInterface, provide_database_interface
+from prefect.logging import get_logger
+from prefect.server.logs import messaging
 from prefect.server.logs import stream
 from prefect.server.schemas.actions import LogCreate
+from prefect.server.logs.storage import (
+    LogStorage,
+    LogStorageUnavailable,
+    get_log_storage,
+)
+import prefect.server.schemas as schemas
 from prefect.server.schemas.core import Log
 from prefect.server.schemas.filters import LogFilter
 from prefect.server.schemas.sorting import LogSort
@@ -21,20 +27,40 @@ from prefect.server.utilities.server import PrefectRouter
 
 router: PrefectRouter = PrefectRouter(prefix="/logs", tags=["Logs"])
 
+if TYPE_CHECKING:
+    import logging
+
+logger: "logging.Logger" = get_logger(__name__)
+
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def create_logs(
     logs: Sequence[LogCreate],
-    db: PrefectDBInterface = Depends(provide_database_interface),
+    log_storage: LogStorage = Depends(get_log_storage),
 ) -> None:
-    """
-    Create new logs from the provided schema.
+    """Write new logs using the configured server log storage.
 
     For more information, see https://docs.prefect.io/v3/how-to-guides/workflows/add-logging.
     """
-    for batch in models.logs.split_logs_into_batches(logs):
-        async with db.session_context(begin_transaction=True) as session:
-            await models.logs.create_logs(session=session, logs=batch)
+    full_logs = [Log(**log.model_dump()) for log in logs]
+    try:
+        await log_storage.write_logs(logs=full_logs)
+    except LogStorageUnavailable as exc:
+        logger.exception("Configured log storage is unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Configured log storage is unavailable",
+        ) from exc
+
+    try:
+        await messaging.publish_logs(full_logs)
+    except RuntimeError as exc:
+        if "can't create new thread at interpreter shutdown" in str(exc):
+            # Background logs sometimes fail to write when the interpreter is shutting
+            # down. This is fixed in Python 3.12.3.
+            logger.debug("Received event during interpreter shutdown, ignoring")
+        else:
+            raise
 
 
 logs_adapter: TypeAdapter[Sequence[Log]] = TypeAdapter(Sequence[Log])
@@ -46,17 +72,21 @@ async def read_logs(
     offset: int = Body(0, ge=0),
     logs: Optional[LogFilter] = None,
     sort: LogSort = Body(LogSort.TIMESTAMP_ASC),
-    db: PrefectDBInterface = Depends(provide_database_interface),
+    log_storage: LogStorage = Depends(get_log_storage),
 ) -> Sequence[Log]:
-    """
-    Query for logs.
-    """
-    async with db.session_context() as session:
-        return logs_adapter.validate_python(
-            await models.logs.read_logs(
-                session=session, log_filter=logs, offset=offset, limit=limit, sort=sort
-            )
+    """Query logs using the configured server log storage."""
+    try:
+        result = await log_storage.read_logs(
+            log_filter=logs, offset=offset, limit=limit, sort=sort
         )
+    except LogStorageUnavailable as exc:
+        logger.exception("Configured log storage is unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Configured log storage is unavailable",
+        ) from exc
+
+    return logs_adapter.validate_python(result)
 
 
 @router.websocket("/out")
